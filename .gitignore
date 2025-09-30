@@ -1,0 +1,88 @@
+# Nextflow work directory
+work/
+
+# Nextflow logs
+.nextflow*
+
+# genomics files
+*.bam
+*.bai
+*.bigWig
+*.inner_distance.txt
+*.bed
+*_lengths.tsv
+*_counts.tsv
+*.gtf
+*_assembled.xlsx
+*_scaled.tsv
+
+# fastq files
+*.fastq.gz
+
+# other salmon and star_salmon directories
+bigwig/
+rseqc/
+dupradar/
+featurecounts/
+geo_submission/
+deseq2_qc/
+aux_info/
+samtools_stats/
+libParams/
+logs/
+log/
+
+# other nf-core/rnaseq directories
+multiqc/
+trimgalore/
+fq_lint/
+fastqc/
+
+# gsea output directories - these patterns need to be manually added after gsea runs
+aug04/
+jul25/
+jul30/
+sep24/
+
+# Large project-specific files and directories
+mm10_ens113_*.xlsx
+FASTQC/
+FASTQSCREEN/
+
+# R directories and files
+R/
+.Rproj.user/
+*.Rhistory
+*.RData
+*_cache/
+*.nb.html
+*.log
+*.rds
+
+# Other directories
+.cache/
+.local/
+.config/
+
+
+# Conda environments
+.conda/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp

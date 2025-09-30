@@ -1,0 +1,1304 @@
+---
+title: "250812Yil - 3' DGE R processing and analysis - Progenitor Cells"
+author: "Charlie Whittaker"
+date: "9/30/2025"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4
+  html_notebook: default
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(tidy=FALSE, cache=TRUE,
+                      dev="png", message=FALSE, error=FALSE, warning=TRUE)
+```
+
+# R processing of gene expression data
+
+## Load libraries
+
+```{r, warning=FALSE,error=FALSE,message=FALSE}
+library(openxlsx)
+library(tidyverse)
+library(reprex)
+library(matrixStats)
+library(XML)
+library(ggrepel)
+library(rtracklayer)
+library(DESeq2)
+library(apeglm)
+library(ComplexHeatmap)
+library(tximport)
+library(edgeR)
+library(gprofiler2)
+library(cluster)
+library(stringr)
+library(fgsea)
+library(UpSetR)
+library(ComplexUpset)
+library(GseaVis)
+```
+
+# load IGB libraries
+
+Loading Custom code
+
+data_formatting_tools.R: functions for organizing, combining, and
+writing data tables analysis_tools.R: functions for running differential
+expression and PCA plots.R: functions for generating figures
+
+setting the scipen option as such makes R display numbers instead of
+shortening to scientific notation ("0.01" instead of "1e-02")
+
+```{r}
+source('Rcode/data_formatting_tools.R')
+source('Rcode/analysis_tools.R')
+source('Rcode/plots.R')
+source('Rcode/common.R')
+source('Rcode/ssGSEA.Library.R')
+
+options(scipen = 9)
+```
+
+# Prepare Annotation - ensembl primary assembly basic annotation
+
+```{r}
+# z <- import("https://ftp.ensembl.org/pub/release-113/gtf/mus_musculus/Mus_musculus.GRCm39.113.gtf.gz")
+# tx2gene <- as.data.frame(z) %>% select(c('transcript_id','gene_id'))
+# tx2gene <- unique(tx2gene)
+# tx2gene <- tx2gene %>% filter(!is.na(transcript_id))
+# 
+# gene2typesym <- as.data.frame(z) %>% select(c('gene_id','gene_biotype','gene_name'))
+# gene2typesym <- unique(gene2typesym)
+# 
+# write.xlsx(tx2gene,colNames=TRUE, quote=FALSE, rowNames=FALSE, file="mm39_ens113_tx2gene.xlsx")
+# write.xlsx(gene2typesym,colNames=TRUE, quote=FALSE, rowNames=FALSE, file="mm39_ens113_gene2typesym.xlsx")
+```
+
+## Import previously saved annotation files
+
+In subsequent runs, necessary annotations can be loaded in this way from
+saved files
+
+```{r}
+tx2gene <- read.xlsx("mm39_ens113_tx2gene.xlsx")
+gene2typesym <- read.xlsx("mm39_ens113_gene2typesym.xlsx")
+```
+
+# Importing 3pDGE data from star_salmon
+
+## Read in samples
+
+```{r}
+dir <- getwd()
+#list.files(dir)
+
+samples <- read.xlsx("250812Yil_samples.xlsx")
+# Exclude low count samples
+# samples <- samples %>% dplyr::filter(ReadCount > 1000000)
+dim(samples)
+# Select stem samples
+samples <- samples %>% dplyr::filter(Cell == "Prog")
+dim(samples)
+colnames(samples)
+table(samples$Condition)
+as.data.frame(table(samples$Condition.Simple))
+```
+
+```{r}
+files <- file.path(dir,samples$Folder, "quant.sf")
+files
+
+names(files) <- paste0(samples$Name)
+all(file.exists(files))
+
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene)
+names(txi)
+
+intCt <- round((txi$counts),0)
+colnames(intCt)<-paste0(colnames(intCt),".intCt")
+
+y <- DGEList(txi$counts)
+#For creating a matrix of CPMs within edgeR, the following code chunk can be used:
+cpms <- cpm(y)
+l2cpm <- log((cpms+1),2)
+colnames(l2cpm)<-paste0(colnames(l2cpm),".l2cpm")
+
+dumpDat <- merge(intCt, l2cpm, by=0, all=TRUE)
+```
+
+## Boxplot of all log2 tpm data to check quality
+
+This plot includes all transcripts/genes in the annotation target.
+
+```{r, fig.width=10,fig.height=6}
+dim(l2cpm)
+
+ggplot(stack(as.data.frame(l2cpm)), aes(x = ind, y = values)) + geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + ggtitle("l2cpm boxplot") 
+```
+
+# Annotation of gene expression data and post-processing
+
+Once quantified, the gene level salmon data needs to be associated with
+additional information to facilitate interpretation
+
+## Annotate assembled data
+
+Note: The annotation file may contain a few examples of multiple
+gene/type annotations associated with the same EnsID. This can duplicate
+rows in dumpData during merge, check dimensions of objects.
+
+```{r}
+assembleDat <- merge(x=dumpDat,y=gene2typesym, by.x=c("Row.names"), by.y=c("gene_id"), all.x=TRUE, all.y = FALSE)
+
+assembleDat <- mutate(assembleDat, Avg = rowMeans(select(assembleDat, ends_with(".l2cpm")), na.rm = TRUE))
+assembleDat <- mutate(assembleDat, Var = rowVars(as.matrix(select(assembleDat, ends_with(".l2cpm")), na.rm = TRUE)))
+assembleDat <- assembleDat %>% mutate(LowExpLowVar = ifelse(Avg <= 0.1 & Var <= 0.1,"Yes","No"))
+```
+
+## Adding MPG column
+
+Often multiple geneids will map to the same gene symbol. In these cases,
+it is helpful to select a representative geneID for each group of gene
+symbols. The code block below iterates through each unique gene symbol,
+compares all of the geneids associated with the same gene symbol and
+identifies the geneid with the highest average expression. This gene is
+then set as the representative (max-per-gene) geneid for that symbol.
+Note: If multiple geneids have the same highest avg expression, the
+first gene that appears in the dataframe is taken
+
+The code below performs the following steps: 1) Create a vector called
+"mpg" of "No" values the same length as the number of rows in the
+dataframe assembleData 2) Loop over the assembleDat object ...
+identifying index values of duplicate genes, updating mpg vector 3)
+Merge mpg vector to assemblDat object with setting column name as "MPG"
+
+```{r}
+mpg <- rep('No', nrow(assembleDat))
+
+for (i in unique(assembleDat[,"gene_name"])){
+    if (is.na(i)){next}
+    idxs <- which(assembleDat[,"gene_name"] == i)
+    max_idx <- which(assembleDat$Avg[idxs] == max(assembleDat$Avg[idxs]))[1]
+    
+    mpg[idxs[max_idx]] <- 'Yes'
+}
+
+assembleDat$MPG <- mpg
+```
+
+### Additional boxplots after data filtering
+
+This plot uses the annotation and expression level calculations to
+select only expressed protein coding genes
+
+```{r, fig.width=10,fig.height=6}
+l2cpm.select <- assembleDat %>% filter(MPG == "Yes" &
+                                   gene_biotype == "protein_coding" &
+                                   LowExpLowVar == "No") %>% select(ends_with(".l2cpm"))
+
+
+dim(l2cpm.select)
+
+ggplot(stack(as.data.frame(l2cpm.select)), aes(x = ind, y = values)) + geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + ggtitle("l2cpm Expressed Protein coding boxplot") 
+```
+
+## Differential Expression Testing
+
+### Convert columns to factors
+
+```{r}
+samples$Condition <- factor(samples$Condition, levels = c("WT_AL_Prog", "WT_Fast_Prog", 
+                                                          "Tfe3_AL_Prog", "Tfe3_Fast_Prog", 
+                                                          "Tfeb_AL_Prog", "Tfeb_Fast_Prog",
+                                                          "Tfe3.Tfeb_AL_Prog","Tfe3.Tfeb_Fast_Prog"))
+
+samples$Condition.Simple <- factor(samples$Condition.Simple, levels = c("WT_AL", "WT_Fast", 
+                                                          "Tfe3_AL", "Tfe3_Fast", 
+                                                          "Tfeb_AL", "Tfeb_Fast",
+                                                          "Tfe3.Tfeb_AL","Tfe3.Tfeb_Fast"))
+
+samples$Animal <- factor(samples$Animal)
+samples$Genotype <- factor(samples$Genotype, levels = c("WT","Tfe3","Tfeb","Tfe3.Tfeb"))
+samples$Diet <- factor(samples$Diet, levels = c("AL","Fast"))
+samples$Cell <- factor(samples$Cell)
+samples$GFP_level <- factor(samples$GFP_level)
+samples$Gender <- factor(samples$Gender, levels = c("F","M"))
+```
+
+### Create dds object from tximport data setting one of the conditions as reference
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = intCt,
+                              colData=samples,
+                              design = ~ Condition.Simple)
+
+dds$Condition.Simple <- relevel(dds$Condition.Simple, "WT_AL")
+```
+
+## Prepare an exploratory PCA plots
+
+By default, plotPCA using the 500 most variable genes for PCA 1 vs PCA 2
+plots this can be adjusted with ntop argument
+
+```{r,fig.width=6,fig.height=6}
+vsd <- vst(dds, blind=TRUE)
+
+plotPCA(vsd, intgroup="Name", ntop=500) + geom_point(size = 4) + ggtitle("NameForProcessing")
+plotPCA(vsd, intgroup="Condition.Simple", ntop=500) + geom_point(size = 4) + ggtitle("Condition.Simple")
+plotPCA(vsd, intgroup="Genotype", ntop=500) + geom_point(size = 4) + ggtitle("Genotype")
+plotPCA(vsd, intgroup="Diet", ntop=500) + geom_point(size = 4) + ggtitle("Diet")
+plotPCA(vsd, intgroup="Cell", ntop=500) + geom_point(size = 4) + ggtitle("Cell")
+plotPCA(vsd, intgroup="Gender", ntop=500) + geom_point(size = 4) + ggtitle("Gender")
+plotPCA(vsd, intgroup="ReadCount", ntop=500) + geom_point(size = 4) + ggtitle("ReadCount")
+plotPCA(vsd, intgroup="MapRate", ntop=500) + geom_point(size = 4) + ggtitle("Mapping Rate")
+
+pcaData <- plotPCA(vsd, intgroup="Condition.Simple", returnData=TRUE, ntop=500)
+pcaData
+#write.xlsx(pcaData, colNames=TRUE, rowNames=TRUE, overwrite = TRUE, file="pca.xlsx")
+```
+
+### Prepare PCA plot figure
+
+this code needs to be updated to automatically set x and y scales
+
+```{r,fig.height=12,fig.width=14}
+# pcaFig <- plotPCA(vsd, intgroup="Condition2", ntop=500) + 
+#   geom_point(size = 4) +
+#   geom_label_repel(aes(label = Condition2), vjust = -0.5, hjust = 0.5, 
+#                    force = 2, min.segment.length = 0.1, max.overlaps = 100) +
+#   scale_y_continuous(limits = c(-16, 16), breaks = seq(-16, 16, by = 2)) +
+#   scale_x_continuous(limits = c(-22, 22), breaks = seq(-22, 22, by = 2)) +
+#   ggtitle("Condition2")
+# pcaFig
+# 
+# pdf('prog_pcaFig.pdf',width=12, height=14)
+# pcaFig
+# dev.off()
+```
+
+# Check counts for some genes of interest and gender genes
+
+Adjust the list as needed
+
+```{r}
+genes.To.check <- c("Tfe3", "Tfeb", "Lgr5", "Ddx3y", "Xist")
+
+for (gene in genes.To.check) {
+  ens.ID <- gene2typesym %>% filter(gene_name == gene)
+  
+  if (nrow(ens.ID) == 0) {
+    warning(paste("Gene", gene, "not found in gene2typesym"))
+    next
+  }
+
+  cts.ToPlot <- plotCounts(dds, gene = ens.ID$gene_id, intgroup = "Condition.Simple", returnData = TRUE)
+  #print(cts.ToPlot)
+  
+  p <- ggplot(cts.ToPlot, aes(x = Condition.Simple, y = count)) +
+    geom_jitter(width = 0.2, size = 3, alpha = 0.9, color = "brown4") +
+    labs(title = paste("Normalized counts for", gene), y = "Normalized count")
+  
+  print(p)
+}
+```
+
+# Differential Expression Comparisons
+
+## There are 28 distinct comparisons:
+
+### Reference: WT_AL
+
+-   WT_Fast vs WT_AL\
+-   Tfe3_AL vs WT_AL\
+-   Tfe3_Fast vs WT_AL\
+-   Tfeb_AL vs WT_AL\
+-   Tfeb_Fast vs WT_AL\
+-   Tfe3.Tfeb_AL vs WT_AL\
+-   Tfe3.Tfeb_Fast vs WT_AL
+
+### Reference: WT_Fast
+
+-   Tfe3_AL vs WT_Fast\
+-   Tfe3_Fast vs WT_Fast\
+-   Tfeb_AL vs WT_Fast\
+-   Tfeb_Fast vs WT_Fast\
+-   Tfe3.Tfeb_AL vs WT_Fast\
+-   Tfe3.Tfeb_Fast vs WT_Fast
+
+### Reference: Tfe3_AL
+
+-   Tfe3_Fast vs Tfe3_AL\
+-   Tfeb_AL vs Tfe3_AL\
+-   Tfeb_Fast vs Tfe3_AL\
+-   Tfe3.Tfeb_AL vs Tfe3_AL\
+-   Tfe3.Tfeb_Fast vs Tfe3_AL
+
+### Reference: Tfe3_Fast
+
+-   Tfeb_AL vs Tfe3_Fast\
+-   Tfeb_Fast vs Tfe3_Fast\
+-   Tfe3.Tfeb_AL vs Tfe3_Fast\
+-   Tfe3.Tfeb_Fast vs Tfe3_Fast
+
+### Reference: Tfeb_AL
+
+-   Tfeb_Fast vs Tfeb_AL\
+-   Tfe3.Tfeb_AL vs Tfeb_AL\
+-   Tfe3.Tfeb_Fast vs Tfeb_AL
+
+### Reference: Tfeb_Fast
+
+-   Tfe3.Tfeb_AL vs Tfeb_Fast\
+-   Tfe3.Tfeb_Fast vs Tfeb_Fast
+
+### Reference: Tfe3.Tfeb_AL
+
+-   Tfe3.Tfeb_Fast vs Tfe3.Tfeb_AL
+
+## Run tests vs WT_AL
+
+```{r}
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+### vs WT_AL_stem comparisons coef
+
+```{r}
+vs_WT_AL.comparisons <- resultsNames(dds)[c(2,3,4,5,6,7,8)]
+vs_WT_AL.comparisons
+```
+
+### Prepare results and join to data table
+
+```{r}
+for (i in vs_WT_AL.comparisons){
+  res <- as.data.frame(lfcShrink(dds, coef=i, type="apeglm"))
+  compar_name <- i
+  cleanCompar <- str_replace(compar_name, "Condition.Simple_", "")
+  stat_col <- paste('WaldStatistic', compar_name, sep = '_')
+  stat <- dds@rowRanges@elementMetadata[,stat_col]
+  res$stat <- stat
+
+  res <- res %>% select(c("log2FoldChange", "pvalue", "padj","stat"))
+  res <- res %>% mutate(absFC = abs(log2FoldChange))
+  res <- res %>% dplyr::mutate(negLogP = -log10(padj))
+
+  colnames(res) <- paste(cleanCompar, colnames(res), sep = '.')
+  res <- tibble::rownames_to_column(res, "RowName")
+  assembleDat <- merge(x=assembleDat,y=res, by.x=c("Row.names"),by.y=c("RowName"), all=TRUE)
+}
+```
+
+## Re-level to WT_Fast
+
+```{r}
+dds$Condition.Simple <- relevel(dds$Condition.Simple, "WT_Fast")
+```
+
+### Run tests vs WT_Fast
+
+```{r}
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+### vs F.WT_stem comparisons coef
+
+```{r}
+vs_WT_Fast.comparisons <- resultsNames(dds)[c(3,4,5,6,7,8)]
+vs_WT_Fast.comparisons
+```
+
+### Prepare results and join to data table
+
+```{r}
+for (i in vs_WT_Fast.comparisons){
+  res <- as.data.frame(lfcShrink(dds, coef=i, type="apeglm"))
+  compar_name <- i
+  cleanCompar <- str_replace(compar_name, "Condition.Simple_", "")
+  stat_col <- paste('WaldStatistic', compar_name, sep = '_')
+  stat <- dds@rowRanges@elementMetadata[,stat_col]
+  res$stat <- stat
+
+  res <- res %>% select(c("log2FoldChange", "pvalue", "padj","stat"))
+  res <- res %>% mutate(absFC = abs(log2FoldChange))
+  res <- res %>% dplyr::mutate(negLogP = -log10(padj))
+
+  colnames(res) <- paste(cleanCompar, colnames(res), sep = '.')
+  res <- tibble::rownames_to_column(res, "RowName")
+  assembleDat <- merge(x=assembleDat,y=res, by.x=c("Row.names"),by.y=c("RowName"), all=TRUE)
+}
+```
+
+## Re-level to Rf2h.WT_stem
+
+```{r}
+dds$Condition.Simple <- relevel(dds$Condition.Simple, "Tfe3_AL")
+```
+
+### Run tests vs Rf2h.WT_stem
+
+```{r}
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+### vs Rf2h.WT_stem comparisons coef
+
+```{r}
+vs_Tfe3_AL.comparisons <- resultsNames(dds)[c(4,5,6,7,8)]
+vs_Tfe3_AL.comparisons
+```
+
+### Prepare results and join to data table
+
+```{r}
+for (i in vs_Tfe3_AL.comparisons){
+  res <- as.data.frame(lfcShrink(dds, coef=i, type="apeglm"))
+  compar_name <- i
+  cleanCompar <- str_replace(compar_name, "Condition.Simple_", "")
+  stat_col <- paste('WaldStatistic', compar_name, sep = '_')
+  stat <- dds@rowRanges@elementMetadata[,stat_col]
+  res$stat <- stat
+
+  res <- res %>% select(c("log2FoldChange", "pvalue", "padj","stat"))
+  res <- res %>% mutate(absFC = abs(log2FoldChange))
+  res <- res %>% dplyr::mutate(negLogP = -log10(padj))
+
+  colnames(res) <- paste(cleanCompar, colnames(res), sep = '.')
+  res <- tibble::rownames_to_column(res, "RowName")
+  assembleDat <- merge(x=assembleDat,y=res, by.x=c("Row.names"),by.y=c("RowName"), all=TRUE)
+}
+```
+
+## Re-level to Tfe3_Fast
+
+```{r}
+dds$Condition.Simple <- relevel(dds$Condition.Simple, "Tfe3_Fast")
+```
+
+### Run tests vs Tfe3_Fast
+
+```{r}
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+### vs Tfe3_Fast comparisons coef
+
+```{r}
+vs_Tfe3_Fast.comparisons <- resultsNames(dds)[c(5,6,7,8)]
+vs_Tfe3_Fast.comparisons
+```
+
+### Prepare results and join to data table
+
+```{r}
+for (i in vs_Tfe3_Fast.comparisons){
+  res <- as.data.frame(lfcShrink(dds, coef=i, type="apeglm"))
+  compar_name <- i
+  cleanCompar <- str_replace(compar_name, "Condition.Simple_", "")
+  stat_col <- paste('WaldStatistic', compar_name, sep = '_')
+  stat <- dds@rowRanges@elementMetadata[,stat_col]
+  res$stat <- stat
+
+  res <- res %>% select(c("log2FoldChange", "pvalue", "padj","stat"))
+  res <- res %>% mutate(absFC = abs(log2FoldChange))
+  res <- res %>% dplyr::mutate(negLogP = -log10(padj))
+
+  colnames(res) <- paste(cleanCompar, colnames(res), sep = '.')
+  res <- tibble::rownames_to_column(res, "RowName")
+  assembleDat <- merge(x=assembleDat,y=res, by.x=c("Row.names"),by.y=c("RowName"), all=TRUE)
+}
+```
+
+## Re-level to Tfeb_AL
+
+```{r}
+dds$Condition.Simple <- relevel(dds$Condition.Simple, "Tfeb_AL")
+```
+
+### Run tests vs Tfeb_AL
+
+```{r}
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+### vs Tfeb_AL comparisons coef
+
+```{r}
+vs_Tfeb_AL.comparisons <- resultsNames(dds)[c(6,7,8)]
+vs_Tfeb_AL.comparisons
+```
+
+### Prepare results and join to data table
+
+```{r}
+for (i in vs_Tfeb_AL.comparisons){
+  res <- as.data.frame(lfcShrink(dds, coef=i, type="apeglm"))
+  compar_name <- i
+  cleanCompar <- str_replace(compar_name, "Condition.Simple_", "")
+  stat_col <- paste('WaldStatistic', compar_name, sep = '_')
+  stat <- dds@rowRanges@elementMetadata[,stat_col]
+  res$stat <- stat
+
+  res <- res %>% select(c("log2FoldChange", "pvalue", "padj","stat"))
+  res <- res %>% mutate(absFC = abs(log2FoldChange))
+  res <- res %>% dplyr::mutate(negLogP = -log10(padj))
+
+  colnames(res) <- paste(cleanCompar, colnames(res), sep = '.')
+  res <- tibble::rownames_to_column(res, "RowName")
+  assembleDat <- merge(x=assembleDat,y=res, by.x=c("Row.names"),by.y=c("RowName"), all=TRUE)
+}
+```
+
+## Re-level to Tfeb_Fast
+
+```{r}
+dds$Condition.Simple <- relevel(dds$Condition.Simple, "Tfeb_Fast")
+```
+
+### Run tests vs Tfeb_Fast
+
+```{r}
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+### vs Tfeb_Fast comparisons coef
+
+```{r}
+vs_Tfeb_Fast.comparisons <- resultsNames(dds)[c(7,8)]
+vs_Tfeb_Fast.comparisons
+```
+
+### Prepare results and join to data table
+
+```{r}
+for (i in vs_Tfeb_Fast.comparisons){
+  res <- as.data.frame(lfcShrink(dds, coef=i, type="apeglm"))
+  compar_name <- i
+  cleanCompar <- str_replace(compar_name, "Condition.Simple_", "")
+  stat_col <- paste('WaldStatistic', compar_name, sep = '_')
+  stat <- dds@rowRanges@elementMetadata[,stat_col]
+  res$stat <- stat
+
+  res <- res %>% select(c("log2FoldChange", "pvalue", "padj","stat"))
+  res <- res %>% mutate(absFC = abs(log2FoldChange))
+  res <- res %>% dplyr::mutate(negLogP = -log10(padj))
+
+  colnames(res) <- paste(cleanCompar, colnames(res), sep = '.')
+  res <- tibble::rownames_to_column(res, "RowName")
+  assembleDat <- merge(x=assembleDat,y=res, by.x=c("Row.names"),by.y=c("RowName"), all=TRUE)
+}
+```
+
+## Re-level to Tfe3.Tfeb_AL
+
+```{r}
+dds$Condition.Simple <- relevel(dds$Condition.Simple, "Tfe3.Tfeb_AL")
+```
+
+### Run tests vs Tfe3.Tfeb_AL
+
+```{r}
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+### vs Tfe3.Tfeb_AL comparisons coef
+
+```{r}
+vs_Tfe3.Tfeb_AL.comparisons <- resultsNames(dds)[c(8)]
+vs_Tfe3.Tfeb_AL.comparisons
+```
+
+### Prepare results and join to data table
+
+```{r}
+for (i in vs_Tfe3.Tfeb_AL.comparisons){
+  res <- as.data.frame(lfcShrink(dds, coef=i, type="apeglm"))
+  compar_name <- i
+  cleanCompar <- str_replace(compar_name, "Condition.Simple_", "")
+  stat_col <- paste('WaldStatistic', compar_name, sep = '_')
+  stat <- dds@rowRanges@elementMetadata[,stat_col]
+  res$stat <- stat
+
+  res <- res %>% select(c("log2FoldChange", "pvalue", "padj","stat"))
+  res <- res %>% mutate(absFC = abs(log2FoldChange))
+  res <- res %>% dplyr::mutate(negLogP = -log10(padj))
+
+  colnames(res) <- paste(cleanCompar, colnames(res), sep = '.')
+  res <- tibble::rownames_to_column(res, "RowName")
+  assembleDat <- merge(x=assembleDat,y=res, by.x=c("Row.names"),by.y=c("RowName"), all=TRUE)
+}
+```
+
+## Write output file
+
+```{r}
+write.xlsx(assembleDat,colNames=TRUE, quote=FALSE, rowNames=FALSE, file="250812Yil_prog_assembled.xlsx")
+```
+
+# Comparison list for checking
+
+```{r}
+# ls(pattern=".comparisons")
+
+# Combine all comparisons in order
+comparisons.check <- data.frame(
+  comparisons = c(
+    vs_WT_AL.comparisons,
+    vs_WT_Fast.comparisons,
+    vs_Tfe3_AL.comparisons,
+    vs_Tfe3_Fast.comparisons,
+    vs_Tfeb_AL.comparisons,
+    vs_Tfeb_Fast.comparisons,
+    vs_Tfe3.Tfeb_AL.comparisons
+  )
+)
+
+# View the result
+comparisons.check
+```
+
+## Upset Plots
+
+```{r fig.width=8,fig.height=6}
+# Filter the data frame based on your initial criteria
+filtered_data <- assembleDat %>% filter(MPG == "Yes" & gene_biotype == "protein_coding")
+
+# Get the column names ending with .padj and .absFC
+padj_columns <- names(filtered_data)[str_detect(names(filtered_data), "\\.padj$")]
+absfc_columns <- names(filtered_data)[str_detect(names(filtered_data), "\\.absFC$")]
+
+# Extract prefixes for naming the lists
+prefixes <- str_remove(padj_columns, "\\.padj$")
+
+# Create a list of data frames, each containing genes for a specific .padj column and .absFC column
+gene_lists <- map2(padj_columns, prefixes, ~ {
+  list_name <- .y
+  fc_column <- paste0(list_name, ".absFC")
+  genes <- filtered_data %>%
+    filter(.data[[.x]] < 0.05 & .data[[fc_column]] > 1) %>%
+    select(gene_name) %>%
+    pull(gene_name)
+  setNames(list(genes), list_name)
+})
+
+# Flatten the list of lists
+gene_lists <- flatten(gene_lists)
+
+# Select a substet of the lists
+
+gene_lists_subset <- gene_lists[c(1:7)]
+names(gene_lists_subset)
+
+# Convert the list of genes into a data frame suitable for UpSet plot
+gene_lists_binary <- fromList(gene_lists_subset)
+
+# Generate the UpSet plot
+UpSetR::upset(gene_lists_binary, sets = names(gene_lists_subset), order.by = "freq",text.scale = 2,show.numbers = "yes")
+```
+
+# Volcano plots
+
+## Prepare gene expression data for plotting
+
+```{r}
+vol_df <- assembleDat %>% dplyr::filter(MPG == "Yes" &
+                                    gene_biotype == "protein_coding" &
+                                    LowExpLowVar == "No") %>% dplyr::select(gene_name, 
+                                                                            ends_with(".log2FoldChange"),
+                                                                            ends_with(".padj"),
+                                                                            ends_with(".absFC"))
+```
+
+## Adjust the data table for better plotting
+
+### Replaces NA value padj columns with 1 and NA value log2FoldChange with 0 and sets y axis according to max(abs(LFC))
+
+```{r}
+vol_df.edit <- vol_df
+
+vol_df.edit <- vol_df.edit <- vol_df.edit %>% mutate_at(vars(ends_with(".log2FoldChange")), ~ ifelse(is.na(.), 0, .))
+vol_df.edit <- vol_df.edit <- vol_df.edit %>% mutate_at(vars(ends_with(".padj")), ~ ifelse(is.na(.), 1, .))
+vol_df.edit <- vol_df.edit <- vol_df.edit %>% mutate_at(vars(ends_with(".absFC")), ~ ifelse(is.na(.), 0, .))
+```
+
+### applies a ceiling to -log10(adp)
+
+This may not be necessary but can help when there are a handful of genes with large -log10(adp)
+
+```{r}
+vol_df.edit <- vol_df.edit <- vol_df.edit %>% mutate_at(vars(ends_with(".padj")), ~ ifelse(. < 1e-10, 1e-10, .))
+```
+
+### identify max fold changes to consider y axes in plots
+
+```{r}
+maxFCs <- vol_df.edit %>% summarize(across(ends_with(".log2FoldChange"), ~ max(abs(.), na.rm = TRUE)))
+maxFCs
+max(maxFCs)
+```
+
+## Annotating genes for coloring
+
+### Manual creation of a gene list to highlight
+
+```{r}
+fasting <- as.data.frame(c("Acaa1a","Acaa1b","Acad8","Acadm","Acot2","Acox1","Acsl3",
+                           "Angptl4","Cpt1a","Crot","Decr1","Decr2","Dgat1","Ech1","Etfb",
+                           "Fabp1","Fabp2","Hoxa1","Hadhb","Hmgcl","Hmgcs2","Jag2","Pdk4","Ucp2"))
+
+colnames(fasting) <- "gene_name"
+fasting <- fasting %>% dplyr::mutate(Fasting = gene_name)
+```
+
+### Creating a gene list to highlight from differential expression results
+
+```{r}
+upWTfast <- assembleDat %>% dplyr::filter(gene_biotype == "protein_coding",
+                                                  MPG == "Yes",
+                                                  #str_starts(gene_name, "Hsp"),
+                                                  WT_Fast_vs_WT_AL.log2FoldChange > 1,
+                                                  WT_Fast_vs_WT_AL.padj < 0.05) %>% dplyr::select(gene_name)
+
+upWTfast <- upWTfast %>% dplyr::mutate(upWTfast = gene_name)
+```
+
+### Join example lists to plotting df
+
+```{r}
+vol_df.edit <- merge(vol_df.edit,fasting,by.x="gene_name",by.y="gene_name", all.x=TRUE, all.y = FALSE)
+vol_df.edit <- merge(vol_df.edit,upWTfast,by.x="gene_name",by.y="gene_name", all.x=TRUE, all.y = FALSE)
+```
+
+## Prepare vector of comparisons to plot
+
+```{r}
+comparisons_to_plot <- colnames(vol_df.edit)
+comparisons_to_plot <- grep("log2FoldChange$", comparisons_to_plot, value = TRUE)
+comparisons_to_plot <- sub("\\.log2FoldChange$", "", comparisons_to_plot)
+comparisons_to_plot
+```
+
+### Plotting the Comparisons - top n fold changes
+
+```{r,fig.width=10,fig.height=10}
+for (i in comparisons_to_plot) {
+  # Highlight DEGs
+  col_log2FoldChange <- paste0(i, ".log2FoldChange")
+  col_padj <- paste0(i, ".padj")
+  col_absFC <- paste0(i, ".absFC")
+
+  vol_df.edit <- vol_df.edit %>%
+    mutate(
+      toColor = if_else(vol_df.edit[[col_absFC]] >= 1 & vol_df.edit[[col_padj]] <= 0.05, "Gene", "Empty")
+    )
+
+  # Identify the maximum fold change for each comparison
+  maxFC <- round(max(vol_df.edit[[col_absFC]]), 0)
+
+  # Identify the maximum -log10 pvalue for each comparison
+  maxP <- round(max(-log10(vol_df.edit[[col_padj]])), 0)
+  
+  # Create sorted_df so that labels are drawn on top
+  # By pvalue
+  # sorted_df <- vol_df.edit %>% arrange(vol_df.edit[[col_padj]])
+  # By foldChange
+  sorted_df <- vol_df.edit %>% arrange(desc(vol_df.edit[[col_absFC]]))
+
+  # Calculate the top n column - adjust the number as desired - these will be labeled with symbol
+  sorted_df <- sorted_df %>%
+    mutate(top = if_else(row_number() <= 25, gene_name, ""))
+
+  # Create the volcano plot
+  plot_title <- paste("Volcano Plot for", i)
+  p <- ggplot(sorted_df, aes(x = -log10(.data[[col_padj]]), y = .data[[col_log2FoldChange]])) +
+    geom_point(aes(color = toColor), size = 2) +
+    geom_label_repel(data = filter(sorted_df, !is.na(top)), aes(label = top), box.padding = 0.5, size = 4,max.overlaps=50) +
+    scale_color_manual(values = c("grey70", "red")) +
+    theme_bw() +
+    geom_hline(yintercept = 0, color = "blue") +
+    theme(
+      panel.border = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(colour = "black"),
+      legend.position = "none"
+    ) +
+    scale_y_continuous(breaks = seq(-maxFC, maxFC, 1), limits = c(-maxFC-1, maxFC+1)) +
+    scale_x_continuous(limits = c(0, maxP+1)) +
+    ggtitle(plot_title)
+  print(p)
+}
+```
+
+### Plotting the Comparisons - gene set of interest
+
+```{r,fig.width=8,fig.height=8}
+for (i in comparisons_to_plot) {
+  # Highlight DEGs
+  col_log2FoldChange <- paste0(i, ".log2FoldChange")
+  col_padj <- paste0(i, ".padj")
+  col_absFC <- paste0(i, ".absFC")
+
+  # Identify the maximum fold change for each comparison
+  maxFC <- round(max(vol_df.edit[[col_absFC]]), 0)
+
+  # Identify the maximum -log10 pvalue for each comparison
+  maxP <- round(max(-log10(vol_df.edit[[col_padj]])), 0)
+
+  # Separate data frames for points and labels
+  points_df <- sorted_df %>% filter(is.na(Fasting))
+  labels_df <- sorted_df %>% filter(!is.na(Fasting))
+
+  # Create the volcano plot
+  plot_title <- paste("Volcano Plot for fasting genes - ", i)
+  p <- ggplot() +
+    geom_point(data = points_df, aes(x = -log10(.data[[col_padj]]), 
+                                     y = .data[[col_log2FoldChange]], color = "grey70"), size = 2) +
+    geom_point(data = labels_df, aes(x = -log10(.data[[col_padj]]), 
+                                     y = .data[[col_log2FoldChange]], color = "red"), size = 3) +
+    geom_label_repel(data = labels_df, aes(x = -log10(.data[[col_padj]]),
+                                           y = .data[[col_log2FoldChange]],
+                                           label = Fasting), box.padding = 0.5, size = 3, max.overlaps = 100) +
+    scale_color_manual(values = c("grey70", "red")) +
+    theme_bw() +
+    geom_hline(yintercept = 0, color = "blue") +
+    theme(
+      panel.border = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(colour = "black"),
+      legend.position = "none"
+    ) +
+    scale_y_continuous(breaks = seq(-maxFC, maxFC, 1), limits = c(-maxFC-0.5, maxFC+0.5)) +
+    scale_x_continuous(limits = c(0, maxP+1)) +
+    ggtitle(plot_title)
+
+  print(p)
+}
+```
+
+
+### Plotting the Comparisons - selected genes
+
+```{r,,fig.width=8,fig.height=8}
+for (i in comparisons_to_plot) {
+  # Highlight DEGs
+  col_log2FoldChange <- paste0(i, ".log2FoldChange")
+  col_padj <- paste0(i, ".padj")
+  col_absFC <- paste0(i, ".absFC")
+
+  # Identify the maximum fold change for each comparison
+  maxFC <- round(max(vol_df.edit[[col_absFC]]), 0)
+
+  # Identify the maximum -log10 pvalue for each comparison
+  maxP <- round(max(-log10(vol_df.edit[[col_padj]])), 0)
+
+  # Separate data frames for points and labels
+  points_df <- sorted_df %>% filter(is.na(upWTfast))
+  labels_df <- sorted_df %>% filter(!is.na(upWTfast))
+
+  # Create the volcano plot
+  plot_title <- paste("Volcano Plot for fasting genes - ", i)
+  p <- ggplot() +
+    geom_point(data = points_df, aes(x = -log10(.data[[col_padj]]), 
+                                     y = .data[[col_log2FoldChange]], color = "grey70"), size = 2) +
+    geom_point(data = labels_df, aes(x = -log10(.data[[col_padj]]), 
+                                     y = .data[[col_log2FoldChange]], color = "red"), size = 3) +
+    geom_label_repel(data = labels_df, aes(x = -log10(.data[[col_padj]]),
+                                           y = .data[[col_log2FoldChange]],
+                                           label = upWTfast), box.padding = 0.5, size = 3, max.overlaps = 100) +
+    scale_color_manual(values = c("grey70", "red")) +
+    theme_bw() +
+    geom_hline(yintercept = 0, color = "blue") +
+    theme(
+      panel.border = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(colour = "black"),
+      legend.position = "none"
+    ) +
+    scale_y_continuous(breaks = seq(-maxFC, maxFC, 1), limits = c(-maxFC-0.5, maxFC+0.5)) +
+    scale_x_continuous(limits = c(0, maxP+1)) +
+    ggtitle(plot_title)
+
+  print(p)
+}
+```
+
+# Check counts for some differentially expressed genes
+
+Adjust the list as needed
+
+```{r}
+genes.To.check <- c("Cpt1a", "Fabp1", "Fabp2", "Decr1", "Hmgcs2")
+
+for (gene in genes.To.check) {
+  ens.ID <- gene2typesym %>% filter(gene_name == gene)
+
+  if (nrow(ens.ID) == 0) {
+    warning(paste("Gene", gene, "not found in gene2typesym"))
+    next
+  }
+
+  cts.ToPlot <- plotCounts(dds, gene = ens.ID$gene_id, intgroup = "Condition.Simple", returnData = TRUE)
+  print(cts.ToPlot)
+
+  cts.ToPlot$Condition.Simple <- factor(cts.ToPlot$Condition.Simple, levels = c("WT_AL","WT_Fast",
+                                                                         "Tfe3_AL", "Tfe3_Fast",
+                                                                         "Tfeb_AL","Tfeb_Fast",
+                                                                         "Tfe3.Tfeb_AL","Tfe3.Tfeb_Fast"))
+
+  p <- ggplot(cts.ToPlot, aes(x = Condition.Simple, y = count)) +
+    geom_jitter(width = 0.2, size = 3, alpha = 0.9, color = "brown4") +
+    labs(title = paste("Normalized counts for", gene), y = "Normalized count")
+
+  print(p)
+}
+```
+
+# GSEA - Functional Class Sorting
+
+## Preparing rank files for GSEA
+
+this code chunk prepares rnk files for Linux GSEA runs
+Create the directory, extract protein coding genes and write rnk file in gsea directory
+
+```{r}
+system("mkdir -p ../gsea && chmod 775 ../gsea")
+
+rnkFile <- assembleDat %>% filter(MPG == "Yes" & gene_biotype == "protein_coding") %>% dplyr::select('gene_name',ends_with(".stat"))
+
+names <- colnames(rnkFile)
+
+for (i in names[-1]){
+  d<-rnkFile %>%  dplyr::select('gene_name',all_of(i))
+  names(d)[1] <- '#Gene'
+  d<-d[complete.cases(d), ]
+  write.table(d, sep='\t',file=paste0("../gsea/",i,".prog.rnk"),col.names=TRUE, quote=FALSE, row.names=FALSE)
+}
+```
+
+# Single sample Gene Set Enrichment Analysis (ssGSEA)
+
+## Extract and prepare gene expression matrix in .gct format from dds object
+
+```{r}
+# Extract the normalized count matrix from the dds
+normalized_counts <- as.data.frame(counts(dds, normalized = TRUE))
+# rename columns - this depends on 3pDGE vs standard
+normalized_counts <- normalized_counts %>% rename_with(~ str_replace(., "\\.intCt$", ".normCt"), ends_with(".intCt"))
+# if standard RNA-Seq just append .normCt
+#normalized_counts <- rename_with(normalized_counts, ~paste0(.x, ".normCt"))
+
+# Annotate counts table with gene information
+normalized_counts <- merge(normalized_counts, gene2typesym, by.x=0, by.y="gene_id", all.x=TRUE, all.y=TRUE)
+
+# Annotate counts table with MPG from assembleData
+expInfo <- assembleDat %>% dplyr::select(Row.names,MPG)
+normalized_counts <- merge(normalized_counts,expInfo, by.x="Row.names", by.y="Row.names", all.x=TRUE, all.y=TRUE)
+
+# Calculate row sum
+normalized_counts <- normalized_counts %>% mutate(Sum = rowSums(select(., ends_with(".normCt"))))
+
+# Filter to protein coding genes, MPG = yes and Sum  > 0
+normalized_counts <- normalized_counts %>% dplyr::filter(gene_biotype == "protein_coding" & MPG == "Yes" & Sum > 0)
+
+# Reorder dataframe and select only columns needed for .gct file
+normalized_counts <- normalized_counts %>% dplyr::select(gene_name,Row.names,ends_with(".normCt"))
+
+# Reorder data columns according to levels
+normalized_counts <- normalized_counts %>% dplyr::select(gene_name,Row.names,
+                                                         contains("WT_AL_Prog"),contains("WT_Fast_Prog"),
+                                                         contains("Tfe3_AL_Prog"),contains("Tfe3_Fast_Prog"),
+                                                         contains("Tfeb_AL_Prog"),contains("Tfeb_Fast_Prog"),
+                                                         contains("Tfe3.Tfeb_AL_Prog"),contains("Tfe3.Tfeb_Fast_Prog"))
+
+
+# Rename ID columns
+normalized_counts <- normalized_counts %>% dplyr::rename(NAME = gene_name, Description = Row.names)
+
+# Prepare gct file
+numDatCols <- normalized_counts %>% select(ends_with(".normCt")) %>% colnames() %>% length()
+numDatRows <- normalized_counts %>% rownames() %>% length()
+
+filename1 <- paste("250812Yil_prog_normalizedCounts", ".gct", sep="")
+cat("#1.2", "\n", sep="\t", file=filename1)
+cat(numDatRows, numDatCols, "\n", sep="\t", file=filename1, append = TRUE)
+
+write.table(normalized_counts, file=filename1, row.names=FALSE, quote = FALSE, sep="\t", append=TRUE)
+```
+
+## run ssGSEA
+
+The path on luria to gene sets is:
+/net/bmc-lab3/data/bcc/charliew/annotationFiles/v2025/ 
+I need to make this path available to the singularity Rstudio
+Currently im copying the necessary gmt files into the analysis dir
+
+```{r}
+ssGSEA.project.dataset(input.ds = "250812Yil_prog_normalizedCounts.gct", output.ds = "mh_prog_ssGSEA", gene.sets.dbfile.list = "mh.all.v2025.1.Mm.symbols.gmt")
+ssGSEA.project.dataset(input.ds = "250812Yil_prog_normalizedCounts.gct", output.ds = "m2cp_prog_ssGSEA", gene.sets.dbfile.list = "m2.cp.v2025.1.Mm.symbols.gmt")
+```
+
+## Import ssGSEA results, row-center the results and export to excel
+
+```{r}
+ssGSEA_file_list <- list.files(pattern = "ssGSEA.gct$", full.names = TRUE)
+
+read_gct_file <- function(file) {
+  read.table(file, header = TRUE, sep = "\t", skip = 2, stringsAsFactors = FALSE)
+}
+
+ssGSEA_gct_list <- lapply(ssGSEA_file_list, read_gct_file)
+ssGSEA.results <- do.call(rbind, ssGSEA_gct_list)
+
+# filter out "combined up and down gene sets"
+
+#ssGSEA.results <- ssGSEA.results %>% dplyr::filter(!grepl("combined UP & DN", Description))
+ssGSEA.results <- ssGSEA.results %>% rename_with(~ str_replace(., "\\.normCt$", ".ssgsea"), ends_with(".normCt"))
+ssGSEA.results <- ssGSEA.results %>% select(Name,ends_with(".ssgsea"))
+
+ssGSEA.results <- ssGSEA.results %>% remove_rownames %>% column_to_rownames(var="Name")
+ssgsea_df <- ssGSEA.results
+
+# Extract group labels from column names - the text pattern here will vary a lot between experiments
+sample_info <- tibble(
+  Sample = colnames(ssgsea_df),
+  Group = str_extract(colnames(ssgsea_df), "(WT|Tfe3|Tfeb|Tfe3\\.Tfeb)_(AL|Fast)_Prog")
+)
+
+# Transpose the data so pathways are rows and samples are columns
+ssgsea_df_t <- t(ssgsea_df)
+colnames(ssgsea_df_t) <- rownames(ssGSEA.results)
+ssgsea_df_t <- as.data.frame(ssgsea_df_t)
+
+
+# Add group info to the transposed data
+ssgsea_df_t$Group <- sample_info$Group
+```
+
+# Function to perform t-tests across groups for each pathway
+
+```{r}
+test_pathways <- function(data, group_col = "Group") {
+  pathways <- colnames(data)[!colnames(data) %in% group_col]
+  results <- lapply(pathways, function(pathway) {
+    df <- data[, c(pathway, group_col)]
+    colnames(df) <- c("Score", "Group")
+    
+    # Perform ANOVA across all groups
+    aov_result <- aov(Score ~ Group, data = df)
+    p_val <- summary(aov_result)[[1]][["Pr(>F)"]][1]
+    
+    # Return pathway name and p-value
+    tibble(Pathway = pathway, P_value = p_val)
+  })
+  
+  bind_rows(results) %>% arrange(P_value)
+}
+```
+
+### Run the test to identify group-level pathway changes
+
+```{r}
+pathway_stats <- test_pathways(ssgsea_df_t)
+# Select the top n pathways with most significant group-level differences
+PathToPlot <- head(pathway_stats$Pathway, 30)
+```
+
+## Standardize the data
+
+```{r}
+ssGSEA.results <- ssGSEA.results %>% data.matrix()
+rc.ssGSEA.results <- calculate_zscore(ssGSEA.results)
+rc.ssGSEA.results.df <- as.data.frame(rc.ssGSEA.results)
+rc.ssGSEA.results.df <- rc.ssGSEA.results.df %>% rename_with(~ str_replace(., "\\.ssgsea$", ".rc_ssgsea"), ends_with(".ssgsea"))
+
+#write.xlsx(rc.ssGSEA.results.df,colNames=TRUE, quote=FALSE, rowNames=TRUE, file="rc.ssGSEA.results.xlsx")
+```
+
+## Heatmap of specific gene sets from ssGSEA
+
+```{r,fig.width=12,fig.height=12}
+rc.ssGSEA.results.select <- rc.ssGSEA.results.df %>%
+  rownames_to_column("Pathway") %>%
+  filter(Pathway %in% PathToPlot) %>%
+  column_to_rownames("Pathway")
+
+colnames(rc.ssGSEA.results.select) <- str_remove(colnames(rc.ssGSEA.results.select), "_Prog\\.rc_ssgsea$")
+
+# Extract group labels from column names
+group_labels <- str_extract(colnames(rc.ssGSEA.results.select), "(WT|Tfe3|Tfeb|Tfe3\\.Tfeb)_(AL|Fast)")
+
+# Ensure it's a proper factor
+group_factor <- factor(group_labels, levels = unique(group_labels))
+
+# Define colors for each group
+group_colors <- structure(
+  c("steelblue", "skyblue", "darkgreen", "lightgreen", "darkred", "salmon", "purple", "orchid"),
+  names = levels(group_factor)
+)
+
+# Create column annotation (no need to name the factor)
+col_ha <- HeatmapAnnotation(
+  Group = group_factor,
+  col = list(Group = group_colors),
+  show_annotation_name = TRUE
+)
+
+Heatmap(
+  rc.ssGSEA.results.select,
+  name = "Z-score",
+  top_annotation = col_ha,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  column_names_gp = gpar(fontsize = 8),
+  row_names_gp = gpar(fontsize = 8)
+)
+```
+
+# Heatmaps
+
+## Prepare gene expression data for plotting
+
+```{r}
+heat_df <- assembleDat %>% dplyr::filter(MPG == "Yes" &
+                                    gene_biotype == "protein_coding" &
+                                    LowExpLowVar == "No") %>% dplyr::select(gene_name,ends_with("WT_AL_Prog.l2cpm"),ends_with("WT_Fast_Prog.l2cpm"),
+                                                                            ends_with("Tfe3_AL_Prog.l2cpm"),ends_with("Tfe3_Fast_Prog.l2cpm"),
+                                                                            ends_with("Tfeb_AL_Prog.l2cpm"),ends_with("Tfeb_Fast_Prog.l2cpm"),
+                                                                            ends_with("Tfe3.Tfeb_AL_Prog.l2cpm"),ends_with("Tfe3.Tfeb_Fast_Prog.l2cpm"),
+                                                                            ends_with(".log2FoldChange"),
+                                                                            ends_with(".padj"),
+                                                                            ends_with(".absFC"))
+```
+
+## Adjust the data table for better plotting
+
+### Replaces NA value padj columns with 1 and NA value log2FoldChange with 0 and sets y axis according to max(abs(LFC))
+
+```{r}
+heat_df.edit <- heat_df
+
+heat_df.edit <- heat_df.edit <- heat_df.edit %>% mutate_at(vars(ends_with(".log2FoldChange")), ~ ifelse(is.na(.), 0, .))
+heat_df.edit <- heat_df.edit <- heat_df.edit %>% mutate_at(vars(ends_with(".padj")), ~ ifelse(is.na(.), 1, .))
+heat_df.edit <- heat_df.edit <- heat_df.edit %>% mutate_at(vars(ends_with(".absFC")), ~ ifelse(is.na(.), 0, .))
+```
+
+## Prepare vector of comparisons to plot
+
+```{r}
+comparisons_to_plot <- colnames(heat_df.edit)
+comparisons_to_plot <- grep("log2FoldChange$", comparisons_to_plot, value = TRUE)
+comparisons_to_plot <- sub("\\.log2FoldChange$", "", comparisons_to_plot)
+comparisons_to_plot
+```
+
+This extracts l2cpm data for some of the most differential expressed
+protein coding genes Adjust filters and check row counts
+
+### Plotting the Comparisons - top n fold changes
+
+```{r,fig.width=13,fig.height=10}
+for (i in comparisons_to_plot) {
+  col_log2FoldChange <- paste0(i, ".log2FoldChange")
+  col_padj <- paste0(i, ".padj")
+  col_absFC <- paste0(i, ".absFC")
+
+  heat_df.toPlot <- heat_df.edit %>%
+    filter(.data[[col_absFC]] >= 1 & .data[[col_padj]] <= 0.05) %>%
+    slice_max(order_by = .data[[col_absFC]], n = 40) %>%
+    select(gene_name, ends_with(".l2cpm"))
+
+  # Skip if no rows to plot
+  if (nrow(heat_df.toPlot) == 0) {
+    message(paste("No DEGs found for", i))
+    next
+  }
+
+  # Set gene_name as rownames and rename columns
+  rownames(heat_df.toPlot) <- heat_df.toPlot$gene_name
+  heat_df.toPlot <- heat_df.toPlot %>% select(-gene_name)
+  heat_df.toPlot <- heat_df.toPlot %>% rename_with(~ str_remove(., "\\.l2cpm$"))
+
+  # Convert to matrix
+  heat_matrix <- as.matrix(heat_df.toPlot)
+
+  # Standardize the data
+  heat_matrix.zscore <- calculate_zscore(heat_matrix)
+  
+  # top annotation
+  # Extract group labels from column names
+  group_labels <- str_extract(colnames(heat_matrix.zscore), "(WT|Tfe3|Tfeb|Tfe3\\.Tfeb)_(AL|Fast)")
+  
+  # Ensure it's a proper factor
+  group_factor <- factor(group_labels, levels = unique(group_labels))
+  
+  # Define colors for each group
+  group_colors <- structure(
+    c("steelblue", "skyblue", "darkgreen", "lightgreen", "darkred", "salmon", "purple", "orchid"),
+    names = levels(group_factor)
+  )
+  
+  # Create column annotation (no need to name the factor)
+  col_ha <- HeatmapAnnotation(
+    Group = group_factor,
+    col = list(Group = group_colors),
+    show_annotation_name = TRUE
+  )
+
+  # Create the heatmap
+  p <- Heatmap(
+    heat_matrix.zscore,
+    top_annotation = col_ha,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    show_row_names = TRUE,
+    row_names_side = "left",
+    column_names_rot = 90,
+    column_names_side = "top",
+    heatmap_legend_param = list(title = paste0(i, " DEG heatmap"))
+  )
+  print(p)
+}
+```
+
+# Supplemental data and GEO files
+
+```{r}
+system("mkdir -p ../geo_submission && chmod 775 ../geo_submission")
+IntCt.geo <- assembleDat %>% dplyr::select(Row.names,ends_with(".intCt"))
+IntCt.geo <- IntCt.geo %>% dplyr::rename(ENSID = Row.names)
+IntCt.geo <- IntCt.geo %>% dplyr::rename_all(~str_replace(., "\\.intCt", ""))
+write.table(IntCt.geo,file="../geo_submission/250812Yil_prog_intCt.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+
+l2cpm.geo <- assembleDat %>% dplyr::select(Row.names,ends_with(".l2cpm"))
+l2cpm.geo <- l2cpm.geo %>% dplyr::rename(ENSID = Row.names)
+l2cpm.geo <- l2cpm.geo %>% dplyr::rename_all(~str_replace(., "\\.l2cpm", ""))
+write.table(l2cpm.geo,file="../geo_submission/250812Yil_prog_l2tpm.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+# write session info
+
+Capturing information about the R session helps document your work
+
+```{r}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "250812Yil_prog_sessionInfo.txt")
+```
