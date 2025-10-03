@@ -4,7 +4,6 @@
 #SBATCH --mail-type=END           # Type of email notification- BEGIN,END,FAIL,ALL. Equivalent to the -m option in SGE
 #SBATCH --mail-user=charliew@mit.edu  # Email to which notifications will be sent
 
-
 ## Hallmark collection
 
 for i in *.rnk
@@ -37,10 +36,10 @@ done
 
 ## Immune collection
 
-for i in *.rnk
-do
-sh /net/bmc-lab3/data/bcc/charliew/gsea_4/GSEA_Linux_4.4.0/gsea-cli.sh GSEAPreranked -rnk $i \
--gmx /net/bmc-lab3/data/bcc/charliew/annotationFiles/v2025/m7.all.v2025.1.Mm.symbols.gmt \
--set_min 5 -set_max 250 \
--rpt_label $i.m7 -plot_top_x 40 -nperm 1000
-done
+# for i in *.rnk
+# do
+# sh /net/bmc-lab3/data/bcc/charliew/gsea_4/GSEA_Linux_4.4.0/gsea-cli.sh GSEAPreranked -rnk $i \
+# -gmx /net/bmc-lab3/data/bcc/charliew/annotationFiles/v2025/m7.all.v2025.1.Mm.symbols.gmt \
+# -set_min 5 -set_max 250 \
+# -rpt_label $i.m7 -plot_top_x 40 -nperm 1000
+# done

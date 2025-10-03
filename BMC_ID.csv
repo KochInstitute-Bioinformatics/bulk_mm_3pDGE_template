@@ -1,0 +1,6 @@
+sample,fastq_1,fastq_2,strandedness
+dxxx1.ConditionA,data/BMC_ID_DYY-xxx1_NA_sequence.fastq.gz,,auto
+dxxx2.ConditionA,data/BMC_ID_DYY-xxx2_NA_sequence.fastq.gz,,auto
+dxxx3.ConditionB,data/BMC_ID_DYY-xxx3_NA_sequence.fastq.gz,,auto
+dxxx4.ConditionB,data/BMC_ID_DYY-xxx4_NA_sequence.fastq.gz,,auto
+
