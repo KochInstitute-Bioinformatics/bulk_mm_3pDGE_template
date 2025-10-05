@@ -1,7 +1,7 @@
 ---
-title: "250430Yil - 3' DGE R processing and analysis - Stem Cells"
+title: "BMCID - 3' DGE R processing and analysis - Details here"
 author: "Charlie Whittaker"
-date: "10/2/2025"
+date: "xx/xx/20xx"
 output: 
   html_document:
     toc: true
@@ -640,6 +640,7 @@ vol_df.edit <- vol_df
 
 vol_df.edit <- vol_df.edit <- vol_df.edit %>% mutate_at(vars(ends_with(".padj")), ~ ifelse(is.na(.), 1, .))
 vol_df.edit <- vol_df.edit <- vol_df.edit %>% mutate_at(vars(ends_with(".log2FoldChange")), ~ ifelse(is.na(.), 0, .))
+vol_df.edit <- vol_df.edit <- vol_df.edit %>% mutate_at(vars(ends_with(".absFC")), ~ ifelse(is.na(.), 0, .))
 ```
 
 ### joins list of annotated genes for coloring
