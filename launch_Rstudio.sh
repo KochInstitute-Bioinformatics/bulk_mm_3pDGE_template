@@ -27,7 +27,17 @@ END
 
 chmod +x ${workdir}/rsession.sh
 
-export APPTAINER_BIND="${workdir}/run:/run,${workdir}/tmp:/tmp,${workdir}/database.conf:/etc/rstudio/database.conf,${workdir}/rsession.sh:/etc/rstudio/rsession.sh,${workdir}/var/lib/rstudio-server:/var/lib/rstudio-server"
+binds="${workdir}/run:/run"
+binds+=",${workdir}/tmp:/tmp"
+binds+=",${workdir}/database.conf:/etc/rstudio/database.conf"
+binds+=",${workdir}/rsession.sh:/etc/rstudio/rsession.sh"
+binds+=",${workdir}/var/lib/rstudio-server:/var/lib/rstudio-server"
+binds+=",/orcd/data/ki/001/core/bcc/annotation_files:/annotationFiles"
+binds+=",/orcd/data/ki/001/core/bcc/scripts:/scripts"
+binds+=",/orcd/data/ki/001/core/bcc/Genomes:/Genomes"
+
+export APPTAINER_BIND="$binds"
+
 export APPTAINERENV_RSTUDIO_SESSION_TIMEOUT=0
 export APPTAINERENV_USER=$(id -un)
 export APPTAINERENV_PASSWORD="koch76"

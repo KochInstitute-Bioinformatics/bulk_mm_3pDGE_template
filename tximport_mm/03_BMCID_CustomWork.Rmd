@@ -1,0 +1,472 @@
+---
+title: "250430Yil - Custom Analyses and Plotting - IL22 Experiment"
+author: "Charlie Whittaker"
+date: "10/7/2025"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(tidy=FALSE, cache=TRUE,
+                      dev="png", message=FALSE, error=FALSE, warning=TRUE)
+```
+
+
+# R processing of gene expression data
+
+## Load libraries
+
+```{r, warning=FALSE,error=FALSE,message=FALSE}
+library(openxlsx)
+library(tidyverse)
+library(reprex)
+library(matrixStats)
+library(XML)
+library(ggrepel)
+library(rtracklayer)
+library(DESeq2)
+library(apeglm)
+library(ComplexHeatmap)
+library(tximport)
+library(edgeR)
+library(gprofiler2)
+library(cluster)
+library(stringr)
+library(fgsea)
+library(UpSetR)
+library(ComplexUpset)
+library(GseaVis)
+```
+
+# load IGB libraries
+
+Loading Custom code
+
+data_formatting_tools.R: functions for organizing, combining, and writing data tables
+analysis_tools.R: functions for running differential expression and PCA
+plots.R: functions for generating figures
+
+setting the scipen option as such makes R display numbers instead of shortening to scientific notation ("0.01" instead of "1e-02")
+
+```{r}
+source('Rcode/data_formatting_tools.R')
+source('Rcode/analysis_tools.R')
+source('Rcode/plots.R')
+source('Rcode/common.R')
+source('Rcode/ssGSEA.Library.R')
+
+options(scipen = 9)
+```
+
+# Read in samples and exclude problematic replicates
+
+```{r}
+dir <- getwd()
+list.files(dir)
+
+samples <- read.xlsx("250430Yil_Samples_Fangtao_Il22.xlsx")
+dim(samples)
+samples
+# Exclude low count samples
+# samples <- samples %>% dplyr::filter(ReadCount > 1000000)
+# dim(samples)
+```
+
+# Read Assembled Data
+
+```{r}
+assembleDat <- read.xlsx("250430Yil_Fangtao_Il22_assembled.xlsx")
+```
+
+# Upset plots
+
+```{r fig.width=8,fig.height=6}
+# Filter the data frame based on your initial criteria
+filtered_data <- assembleDat %>% filter(MPG == "Yes" & gene_biotype == "protein_coding")
+
+# Get the column names ending with .padj and .absFC
+padj_columns <- names(filtered_data)[str_detect(names(filtered_data), "\\.padj$")]
+absfc_columns <- names(filtered_data)[str_detect(names(filtered_data), "\\.absFC$")]
+
+# Extract prefixes for naming the lists
+prefixes <- str_remove(padj_columns, "\\.padj$")
+
+# Create a list of data frames, each containing genes for a specific .padj column and .absFC column
+gene_lists <- map2(padj_columns, prefixes, ~ {
+  list_name <- .y
+  fc_column <- paste0(list_name, ".absFC")
+  genes <- filtered_data %>%
+    filter(.data[[.x]] < 0.05 & .data[[fc_column]] > 1) %>%
+    select(gene_name) %>%
+    pull(gene_name)
+  setNames(list(genes), list_name)
+})
+
+# Flatten the list of lists
+gene_lists <- flatten(gene_lists)
+
+# Select a substet of the lists
+
+#gene_lists_subset <- gene_lists[c(4,5,7,8)]
+
+# Convert the list of genes into a data frame suitable for UpSet plot
+gene_lists_binary <- fromList(gene_lists)
+
+# Generate the UpSet plot
+UpSetR::upset(gene_lists_binary, sets = names(gene_lists), order.by = "freq",text.scale = 2,show.numbers = "yes")
+```
+
+## Volcano plots
+
+### Prepare gene expression data for plotting
+
+```{r}
+vol_df <- assembleDat %>% dplyr::filter(MPG == "Yes" &
+                                    gene_biotype == "protein_coding" &
+                                    LowExpLowVar == "No") %>% dplyr::select(gene_name, 
+                                                                            ends_with(".log2FoldChange"),
+                                                                            ends_with(".padj"),
+                                                                            ends_with(".absFC"))
+```
+
+## Adjust the data table for better plotting
+
+### Replaces NA value padj columns with 1 and NA value log2FoldChange with 0 and sets y axis according to max(abs(LFC))
+
+```{r}
+vol_df.edit <- vol_df
+
+vol_df.edit <- vol_df.edit <- vol_df.edit %>% mutate_at(vars(ends_with(".padj")), ~ ifelse(is.na(.), 1, .))
+vol_df.edit <- vol_df.edit <- vol_df.edit %>% mutate_at(vars(ends_with(".log2FoldChange")), ~ ifelse(is.na(.), 0, .))
+vol_df.edit <- vol_df.edit <- vol_df.edit %>% mutate_at(vars(ends_with(".absFC")), ~ ifelse(is.na(.), 0, .))
+```
+
+### joins list of annotated genes for coloring
+
+```{r}
+#vol_df.edit <- merge(vol_df.edit,OfInterest,by.x="gene",by.y="Gene", all.x=TRUE, all.y = FALSE)
+#vol_df.edit <- vol_df.edit %>% arrange(!is.na(Pathway),Pathway)
+```
+
+### applies a ceiling to -log10(adp)
+
+This may not be necessary but can help when there are a handful of genes with large -log10(adp)
+
+```{r}
+vol_df.edit <- vol_df.edit <- vol_df.edit %>% mutate_at(vars(ends_with(".padj")), ~ ifelse(. < 1e-10, 1e-10, .))
+```
+
+### sets y axis according to max(abs(LFC))
+
+```{r}
+maxFCs <- vol_df.edit %>% summarize(across(ends_with(".log2FoldChange"), ~ max(abs(.), na.rm = TRUE)))
+maxFCs
+max(maxFCs)
+```
+
+### Prepare vector of plot comparisons
+
+```{r}
+comparisons_to_plot <- colnames(vol_df.edit)
+comparisons_to_plot <- grep("log2FoldChange$", comparisons_to_plot, value = TRUE)
+comparisons_to_plot <- sub("\\.log2FoldChange$", "", comparisons_to_plot)
+comparisons_to_plot
+```
+
+### Plotting the Comparisons
+
+```{r,fig.width=10,fig.height=10}
+for (i in comparisons_to_plot) {
+  # Highlight DEGs
+  col_log2FoldChange <- paste0(i, ".log2FoldChange")
+  col_padj <- paste0(i, ".padj")
+  col_absFC <- paste0(i, ".absFC")
+
+  vol_df.edit <- vol_df.edit %>%
+    mutate(
+      toColor = if_else(vol_df.edit[[col_absFC]] >= 1 & vol_df.edit[[col_padj]] <= 0.05, "Gene", "Empty")
+    )
+
+  # Identify the maximum fold change for each comparison
+  maxFC <- round(max(vol_df.edit[[col_absFC]]), 0)
+
+  # Identify the maximum -log10 pvalue for each comparison
+  maxP <- round(max(-log10(vol_df.edit[[col_padj]])), 0)
+  
+  # Create sorted_df so that labels are drawn on top
+  # By pvalue
+  # sorted_df <- vol_df.edit %>% arrange(vol_df.edit[[col_padj]])
+  # By foldChange
+  sorted_df <- vol_df.edit %>% arrange(desc(vol_df.edit[[col_absFC]]))
+
+  # Calculate the top n column - adjust the number as desired - these will be labeled with symbol
+  sorted_df <- sorted_df %>%
+    mutate(top = if_else(row_number() <= 25, gene_name, ""))
+
+  # Create the volcano plot
+  plot_title <- paste("Volcano Plot for", i)
+  p <- ggplot(sorted_df, aes(x = -log10(.data[[col_padj]]), y = .data[[col_log2FoldChange]])) +
+    geom_point(aes(color = toColor), size = 2) +
+    geom_label_repel(data = filter(sorted_df, !is.na(top)), aes(label = top), box.padding = 0.5, size = 4,max.overlaps=50) +
+    scale_color_manual(values = c("grey70", "red")) +
+    theme_bw() +
+    geom_hline(yintercept = 0, color = "blue") +
+    theme(
+      panel.border = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(colour = "black"),
+      legend.position = "none"
+    ) +
+    scale_y_continuous(breaks = seq(-maxFC, maxFC, 1), limits = c(-maxFC-1, maxFC+1)) +
+    scale_x_continuous(limits = c(0, maxP+1)) +
+    ggtitle(plot_title)
+  print(p)
+}
+```
+
+# Single sample Gene Set Enrichment Analysis (ssGSEA)
+
+## Import ssGSEA results, row-center the results and export to excel
+
+These data were calculated in the processing Rmd
+
+```{r}
+ssGSEA_file_list <- list.files(pattern = "_Il22_ssGSEA.gct$", full.names = TRUE)
+
+read_gct_file <- function(file) {
+  read.table(file, header = TRUE, sep = "\t", skip = 2, stringsAsFactors = FALSE)
+}
+
+ssGSEA_gct_list <- lapply(ssGSEA_file_list, read_gct_file)
+ssGSEA.results <- do.call(rbind, ssGSEA_gct_list)
+ssGSEA.results <- ssGSEA.results %>% dplyr::select(-Description)
+
+# filter out "combined up and down gene sets"
+
+#ssGSEA.results <- ssGSEA.results %>% dplyr::filter(!grepl("combined UP & DN", Description))
+ssGSEA.results <- ssGSEA.results %>% rename_with(~ str_replace(., "\\.normCt$", ".ssgsea"), ends_with(".normCt"))
+
+ssGSEA.results <- ssGSEA.results %>% remove_rownames %>% column_to_rownames(var="Name")
+ssgsea_df <- ssGSEA.results
+
+# Extract group labels from column names - the text pattern here will vary a lot between experiments
+sample_info <- tibble(
+  Sample = colnames(ssgsea_df),
+  Group = str_extract(colnames(ssgsea_df), "(IL22\\.KO|IL22|WT)")
+)
+
+
+# Transpose the data so pathways are rows and samples are columns
+ssgsea_df_t <- t(ssgsea_df)
+colnames(ssgsea_df_t) <- rownames(ssGSEA.results)
+ssgsea_df_t <- as.data.frame(ssgsea_df_t)
+
+
+# Add group info to the transposed data
+ssgsea_df_t$Group <- sample_info$Group
+```
+
+# Function to perform t-tests across groups for each pathway
+
+```{r}
+test_pathways <- function(data, group_col = "Group") {
+  pathways <- colnames(data)[!colnames(data) %in% group_col]
+  results <- lapply(pathways, function(pathway) {
+    df <- data[, c(pathway, group_col)]
+    colnames(df) <- c("Score", "Group")
+    
+    # Perform ANOVA across all groups
+    aov_result <- aov(Score ~ Group, data = df)
+    p_val <- summary(aov_result)[[1]][["Pr(>F)"]][1]
+    
+    # Return pathway name and p-value
+    tibble(Pathway = pathway, P_value = p_val)
+  })
+  
+  bind_rows(results) %>% arrange(P_value)
+}
+```
+
+### Run the test to identify group-level pathway changes
+
+```{r}
+pathway_stats <- test_pathways(ssgsea_df_t)
+# Select the top n pathways with most significant group-level differences
+PathToPlot <- head(pathway_stats$Pathway, 40)
+```
+
+## Standardize the data
+
+```{r}
+ssGSEA.results <- ssGSEA.results %>% data.matrix()
+rc.ssGSEA.results <- calculate_zscore(ssGSEA.results)
+rc.ssGSEA.results.df <- as.data.frame(rc.ssGSEA.results)
+rc.ssGSEA.results.df <- rc.ssGSEA.results.df %>% rename_with(~ str_replace(., "\\.ssgsea$", ".rc_ssgsea"), ends_with(".ssgsea"))
+
+#write.xlsx(rc.ssGSEA.results.df,colNames=TRUE, quote=FALSE, rowNames=TRUE, file="rc.ssGSEA.results.xlsx")
+```
+
+## Heatmap of specific gene sets from ssGSEA
+
+```{r,fig.width=12,fig.height=12}
+rc.ssGSEA.results.select <- rc.ssGSEA.results.df %>%
+  rownames_to_column("Pathway") %>%
+  filter(Pathway %in% PathToPlot) %>%
+  column_to_rownames("Pathway")
+
+colnames(rc.ssGSEA.results.select) <- str_remove(colnames(rc.ssGSEA.results.select), "\\.rc_ssgsea$")
+
+# Extract group labels from column names
+str_extract(colnames(rc.ssGSEA.results.select), "(IL22\\.KO|IL22|WT)")
+group_labels <- str_extract(colnames(rc.ssGSEA.results.select), "(IL22\\.KO|IL22|WT)")
+
+# Ensure it's a proper factor
+group_factor <- factor(group_labels, levels = unique(group_labels))
+
+# Define colors for each group
+group_colors <- structure(
+  c("steelblue", "darkgreen", "salmon"),
+  names = levels(group_factor)
+)
+
+# Create column annotation (no need to name the factor)
+col_ha <- HeatmapAnnotation(
+  Group = group_factor,
+  col = list(Group = group_colors),
+  show_annotation_name = TRUE
+)
+
+Heatmap(
+  rc.ssGSEA.results.select,
+  name = "Z-score",
+  top_annotation = col_ha,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  column_names_gp = gpar(fontsize = 8),
+  row_names_gp = gpar(fontsize = 8)
+)
+```
+
+# Heatmaps
+
+## Prepare gene expression data for plotting
+
+```{r}
+heat_df <- assembleDat %>% dplyr::filter(MPG == "Yes" &
+                                    gene_biotype == "protein_coding" &
+                                    LowExpLowVar == "No")
+
+# Reorder data columns according to levels
+order.tmp <- samples %>% arrange(Condition)
+colOrder <- paste0(order.tmp$Name, ".l2cpm")
+
+heat_df <- heat_df %>% dplyr::select(gene_name, all_of(colOrder),
+                                     ends_with(".log2FoldChange"),
+                                     ends_with(".padj"),
+                                     ends_with(".absFC"))
+```
+
+## Adjust the data table for better plotting
+
+Replaces NA value padj columns with 1 and NA value log2FoldChange or absFC with 0 and sets y axis according to max(absLFC)
+
+```{r}
+heat_df.edit <- heat_df
+
+heat_df.edit <- heat_df.edit <- heat_df.edit %>% mutate_at(vars(ends_with(".log2FoldChange")), ~ ifelse(is.na(.), 0, .))
+heat_df.edit <- heat_df.edit <- heat_df.edit %>% mutate_at(vars(ends_with(".padj")), ~ ifelse(is.na(.), 1, .))
+heat_df.edit <- heat_df.edit <- heat_df.edit %>% mutate_at(vars(ends_with(".absFC")), ~ ifelse(is.na(.), 0, .))
+```
+
+## Prepare vector of comparisons to plot
+
+```{r}
+comparisons_to_plot <- colnames(heat_df.edit)
+comparisons_to_plot <- grep("log2FoldChange$", comparisons_to_plot, value = TRUE)
+comparisons_to_plot <- sub("\\.log2FoldChange$", "", comparisons_to_plot)
+comparisons_to_plot
+```
+
+This extracts l2cpm data for some of the most differential expressed
+protein coding genes Adjust filters and check row counts
+
+### Plotting the Comparisons - top n fold changes
+
+```{r,fig.width=13,fig.height=10}
+for (i in comparisons_to_plot) {
+  col_log2FoldChange <- paste0(i, ".log2FoldChange")
+  col_padj <- paste0(i, ".padj")
+  col_absFC <- paste0(i, ".absFC")
+
+  heat_df.toPlot <- heat_df.edit %>%
+    filter(.data[[col_absFC]] >= 1 & .data[[col_padj]] <= 0.05) %>%
+    slice_max(order_by = .data[[col_absFC]], n = 40) %>%
+    select(gene_name, ends_with(".l2cpm"))
+
+  # Skip if no rows to plot
+  if (nrow(heat_df.toPlot) == 0) {
+    message(paste("No DEGs found for", i))
+    next
+  }
+
+  # Set gene_name as rownames and rename columns
+  rownames(heat_df.toPlot) <- heat_df.toPlot$gene_name
+  heat_df.toPlot <- heat_df.toPlot %>% select(-gene_name)
+  heat_df.toPlot <- heat_df.toPlot %>% rename_with(~ str_remove(., "\\.l2cpm$"))
+
+  # Convert to matrix
+  heat_matrix <- as.matrix(heat_df.toPlot)
+
+  # Standardize the data
+  heat_matrix.zscore <- calculate_zscore(heat_matrix)
+  
+  # top annotation
+  # Extract group labels from column names
+  group_labels <- str_extract(colnames(rc.ssGSEA.results.select), "(IL22\\.KO|IL22|WT)")
+  
+  # Ensure it's a proper factor
+  group_factor <- factor(group_labels, levels = unique(group_labels))
+  
+  # Define colors for each group
+  group_colors <- structure(
+    c("steelblue", "darkgreen", "salmon"),
+    names = levels(group_factor)
+  )
+  
+  # Create column annotation (no need to name the factor)
+  col_ha <- HeatmapAnnotation(
+    Group = group_factor,
+    col = list(Group = group_colors),
+    show_annotation_name = TRUE
+  )
+
+  # Create the heatmap
+  p <- Heatmap(
+    heat_matrix.zscore,
+    top_annotation = col_ha,
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    show_row_names = TRUE,
+    row_names_side = "left",
+    column_names_rot = 90,
+    column_names_side = "top",
+    heatmap_legend_param = list(title = paste0(i, " DEG heatmap"))
+  )
+  print(p)
+}
+```
+
+# write session info
+
+Capturing information about the R session helps document your work
+
+```{r}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "03_250430Yil_Fangtao_IL22_Custom_sessionInfo.txt")
+```

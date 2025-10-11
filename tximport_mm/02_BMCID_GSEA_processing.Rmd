@@ -1,0 +1,351 @@
+---
+title: "250430Yil - Prerank GSEA processing and visualization - IL22 Experiment"
+author: "Charlie Whittaker"
+date: "10/7/2025"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(tidy=FALSE, cache=TRUE,
+                      dev="png", message=FALSE, error=FALSE, warning=TRUE)
+```
+
+
+# R processing of gene expression data
+
+## Load libraries
+
+```{r, warning=FALSE,error=FALSE,message=FALSE}
+library(openxlsx)
+library(tidyverse)
+library(reprex)
+library(matrixStats)
+library(XML)
+library(ggrepel)
+library(rtracklayer)
+library(DESeq2)
+library(apeglm)
+library(ComplexHeatmap)
+library(tximport)
+library(edgeR)
+library(gprofiler2)
+library(cluster)
+library(stringr)
+library(fgsea)
+library(UpSetR)
+library(ComplexUpset)
+library(GseaVis)
+```
+
+# load IGB libraries
+
+Loading Custom code
+
+data_formatting_tools.R: functions for organizing, combining, and writing data tables
+analysis_tools.R: functions for running differential expression and PCA
+plots.R: functions for generating figures
+
+setting the scipen option as such makes R display numbers instead of shortening to scientific notation ("0.01" instead of "1e-02")
+
+```{r}
+source('Rcode/data_formatting_tools.R')
+source('Rcode/analysis_tools.R')
+source('Rcode/plots.R')
+source('Rcode/common.R')
+source('Rcode/ssGSEA.Library.R')
+
+options(scipen = 9)
+```
+
+# Prepare Annotation - ensembl primary assembly basic annotation
+
+```{r}
+z <- import("/Genomes/mm39_ens113/Mus_musculus.GRCm39.113.gtf")
+tx2gene <- as.data.frame(z) %>% select(c('transcript_id','gene_id'))
+tx2gene <- unique(tx2gene)
+tx2gene <- tx2gene %>% filter(!is.na(transcript_id))
+
+gene2typesym <- as.data.frame(z) %>% select(c('gene_id','gene_biotype','gene_name'))
+gene2typesym <- unique(gene2typesym)
+
+#write.xlsx(tx2gene,colNames=TRUE, quote=FALSE, rowNames=FALSE, file="mm39_ens113_tx2gene.xlsx")
+#write.xlsx(gene2typesym,colNames=TRUE, quote=FALSE, rowNames=FALSE, file="mm39_ens113_gene2typesym.xlsx")
+```
+
+## Import previously saved annotation files
+
+In subsequent runs, necessary annotations can be loaded in this way from
+saved files
+
+```{r}
+#tx2gene <- read.xlsx("mm39_ens113_tx2gene.xlsx")
+#gene2typesym <- read.xlsx("mm39_ens113_gene2typesym.xlsx")
+```
+
+# Importing 3pDGE data from star_salmo
+
+## Read in samples and exclude problematic replicates
+
+```{r}
+dir <- getwd()
+list.files(dir)
+
+samples <- read.xlsx("250430Yil_Samples_Fangtao_Il22.xlsx")
+dim(samples)
+samples
+# Exclude low count samples
+# samples <- samples %>% dplyr::filter(ReadCount > 1000000)
+# dim(samples)
+```
+
+# GSEA - Functional Class Sorting
+
+## Preparing rank files for GSEA
+
+This extracts protein coding genes from assembled data files, adjusts the data and write rnk file in gsea directory.
+This code was executed inside of the processing Rmd and is retained here for reference.
+
+```{r}
+# system("mkdir -p ../Il22_gsea && chmod 775 ../Il22_gsea")
+# system("cp prerank_4.4.0_v2025.1.sh ../Il22_gsea")
+# 
+# rnkFile <- assembleDat %>% filter(MPG == "Yes" & gene_biotype == "protein_coding") %>% dplyr::select('gene_name',ends_with(".stat"))
+# 
+# names <- colnames(rnkFile)
+# 
+# for (i in names[-1]){
+#   d<-rnkFile %>%  dplyr::select('gene_name',all_of(i))
+#   names(d)[1] <- '#Gene'
+#   d<-d[complete.cases(d), ]
+#   write.table(d, sep='\t',file=paste0("../Il22_gsea/",i,".rnk"),col.names=TRUE, quote=FALSE, row.names=FALSE)
+# }
+```
+
+## Process GSEA results to produce a single output file
+
+### Identify files that need to be imported - the basedir will change according to run
+
+```{r}
+# Note: do not include trailing / in base_dir
+base_dir <- "../Il22_gsea/oct05"
+
+# Get a list of directories in the base directory
+sub_dirs <- list.dirs(base_dir, recursive = FALSE)
+
+# Initialize an empty list to store file paths
+file_list <- list()
+
+# Loop through each sub-directory
+for (sub_dir in sub_dirs) {
+  # Get a list of files in the sub-directory that match the pattern
+  files <- list.files(path = sub_dir, pattern = "^gsea_.*\\.tsv$", full.names = TRUE)
+  # Add the files to the file list
+  file_list <- c(file_list, files)
+}
+```
+
+### Import the GSEA data into a list of lists
+
+```{r}
+gsea_results.list <- lapply(file_list, read.delim)
+```
+
+### Function to convert filepaths to shortnames
+
+gsea folder information needs to be adjusted for each run
+
+```{r}
+# Define a function to process each file path
+process_filepath <- function(filepath) {
+  # Remove folder info from the front of the file path
+  short_filename <- gsub("../Il22_gsea/oct05/", "", filepath)
+  # Replace ".rnk." with "_"
+  short_filename <- gsub(".stat.rnk.", "_", short_filename)
+  # Add "_pos" if "pos" is in the remainder or "_neg" if "neg" in the remainder
+  if (grepl("_pos", short_filename)) {
+    short_filename <- paste0(short_filename, "_pos")
+  } else if (grepl("neg", short_filename)) {
+    short_filename <- paste0(short_filename, "_neg")
+  }
+  short_filename <- gsub("\\.GseaP.*_neg$", "_neg", short_filename)
+  short_filename <- gsub("\\.GseaP.*_pos$", "_pos", short_filename)
+  return(short_filename)
+}
+```
+
+### Process the filepaths
+
+```{r}
+# Apply the function to each file path in file_list
+short_filenames <- lapply(file_list, process_filepath)
+# Rename the list of gsea results
+names(gsea_results.list) <- short_filenames
+```
+
+### extract relevant columns from the dataframes
+
+```{r}
+# Define the columns to select
+columns_to_select <- c("NAME", "SIZE", "NES", "FDR.q.val")
+# Loop through the list of dataframes
+gsea_results.list <- lapply(gsea_results.list, function(df) {
+  # Select the desired columns using dplyr::select
+  df_selected <- dplyr::select(df, all_of(columns_to_select))
+  # Return the modified dataframe
+  return(df_selected)
+})
+```
+
+### Add a comparison column containing the name of each results list
+
+```{r}
+# Loop through the list of dataframes
+for (comparison_name in names(gsea_results.list)) {
+  new_name <- gsub("_pos$|_neg$", "", comparison_name)
+  # Access the dataframe by its name
+  df <- gsea_results.list[[comparison_name]]
+  # Add a new column containing the comparison name
+  df <- df %>% mutate(Comparison = new_name)
+  # Update the dataframe in the list
+  gsea_results.list[[comparison_name]] <- df
+}
+```
+
+### Ensure that the NES values are numeric
+
+```{r}
+gsea_results.list <- lapply(gsea_results.list, function(x) {
+  x$NES <- as.numeric(x$NES)
+  return(x)
+})
+```
+
+### Assemble the data into a single output file and export the results
+
+```{r}
+non_empty_dfs <- gsea_results.list[sapply(gsea_results.list, nrow) > 0]
+combined_df <- bind_rows(non_empty_dfs, .id = "ComparisonFull")
+
+# Use mutate and str_extract to create clean 'Comparison' and 'Collection' column
+combined_df <- combined_df %>%
+  mutate(Collection = str_extract(Comparison, "[^_]+$")) %>%
+  mutate(Comparison = str_remove(Comparison, "_m2cp|_m5bp|_mh"))
+```
+
+### Pivot GSEA results
+
+```{r}
+# Get the maximum SIZE value for each NAME
+df_size_max <- combined_df %>%
+  group_by(NAME) %>%
+  summarize(SIZE = max(SIZE, na.rm = TRUE), .groups = 'drop')
+
+# Ensure no duplicate entries for the same NAME and Comparison
+df_summary <- combined_df %>%
+  group_by(NAME, Comparison, Collection) %>%
+  summarize(NES = mean(NES, na.rm = TRUE), FDR.q.val = mean(FDR.q.val, na.rm = TRUE), .groups = 'drop')
+```
+
+# Pivot the dataframe to get NES and FDR.q.val with correct column names
+
+```{r}
+pivoted_df <- df_summary %>%
+  pivot_wider(names_from = Comparison,
+              values_from = c(NES, FDR.q.val),
+              names_sep = ".") %>%
+  rename_with(~ sub("^(.+?)\\.NES$", "\\1.NES", .), starts_with("NES")) %>%
+  rename_with(~ sub("^(.+?)\\.FDR.q.val$", "\\1.FDR.q.val", .), starts_with("FDR.q.val"))
+```
+
+# Combine the SIZE column with the pivoted dataframe
+
+```{r}
+final_df <- pivoted_df %>%
+  left_join(df_size_max, by = "NAME") %>%
+  select(NAME, SIZE, Collection, everything()) # Ensure Collection is included and in the right order
+
+# Identify NES columns
+nes_columns <- grep("^NES", names(final_df), value = TRUE)
+
+# Identify FDR.q.val columns
+fdr_columns <- grep("^FDR.q.val", names(final_df), value = TRUE)
+
+# Create MaxNES and MinFDR column with the minimum value of all FDR.q.val columns
+final_df <- final_df %>%
+  rowwise() %>%
+  mutate(MaxNES = max(c_across(all_of(nes_columns)), na.rm = TRUE)) %>%
+  mutate(MinFDR = min(c_across(all_of(fdr_columns)), na.rm = TRUE)) %>%
+  ungroup()
+
+# Sort final_df by MinFDR with smallest values at the top
+final_df <- final_df %>% arrange(MinFDR)
+
+# Save the final dataframe
+#write.xlsx(final_df, "GSEA_pivot.xlsx")
+```
+
+### Generate NES heatmaps
+
+```{r fig.width=4,fig.height=6}
+gsea_toPlot <- final_df %>% 
+  dplyr::filter(Collection == "mh", MinFDR < 0.05, MaxNES > 2) %>%
+  dplyr::select(NAME,starts_with("NES")) %>%
+  column_to_rownames(var = "NAME")
+
+# Remove "GOBP_" from the row names
+# rownames(gsea_toPlot) <- gsub("GOBP_", "", rownames(gsea_toPlot))
+
+# Create the heatmap with reduced legend size and modified row labels
+heatmap <- Heatmap(as.matrix(gsea_toPlot),
+                   name = "NES",
+                   cluster_rows = TRUE,
+                   cluster_columns = TRUE,
+                   show_row_names = TRUE,
+                   show_column_names = TRUE,
+                   row_names_gp = gpar(fontsize = 5),  # Adjust font size for readability
+                   column_names_gp = gpar(fontsize = 8), # Adjust font size for readability
+                   heatmap_legend_param = list(
+                     title_gp = gpar(fontsize = 8),  # Title font size
+                     labels_gp = gpar(fontsize = 6),  # Labels font size
+                     grid_width = unit(2, "mm"),      # Width of the legend color bar
+                     grid_height = unit(2, "mm")      # Height of the legend color bar
+                   ))
+
+heatmap
+```
+
+## GSEA enrichment plots
+
+### Hallmark Set
+Random example genes highlighted
+
+```{r,fig.width=7,fig.height=5}
+gene <- c("Ifitm1","Ifitm3","Casp1") 
+tt.plot <- gseaNb(object = NULL,
+       filePath = "../Il22_gsea/oct05/IL22_vs_WT.stat.rnk.mh.GseaPreranked.1759696017912/",
+       geneSetID = "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+       subPlot = 2,
+       rmHt = F,
+       legend.position = c(0.8,0.8),
+       termWidth = 50,
+       addGene = gene,
+       addPval = T,
+       pvalX = 0.8,pvalY = 0.8)
+
+tt.plot
+
+#ggsave("gsea_example.pdf", plot = tt.plot, device = "pdf", width = 7, height = 5, dpi = 300)
+```
+
+# write session info
+
+Capturing information about the R session helps document your work
+
+```{r}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "250530Yil_Fangtao_Il22_GSEA_sessionInfo.txt")
+```
