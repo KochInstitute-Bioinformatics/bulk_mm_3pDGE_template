@@ -32,9 +32,9 @@ binds+=",${workdir}/tmp:/tmp"
 binds+=",${workdir}/database.conf:/etc/rstudio/database.conf"
 binds+=",${workdir}/rsession.sh:/etc/rstudio/rsession.sh"
 binds+=",${workdir}/var/lib/rstudio-server:/var/lib/rstudio-server"
-binds+=",/orcd/data/ki/001/core/bcc/annotation_files:/annotationFiles"
-binds+=",/orcd/data/ki/001/core/bcc/scripts:/scripts"
-binds+=",/orcd/data/ki/001/core/bcc/Genomes:/Genomes"
+binds+=",/orcd/data/ki/002/core/bcc/IGB_Resources/annotation_files:/annotationFiles"
+binds+=",/orcd/data/ki/002/core/bcc/IGB_Resources/scripts:/scripts"
+binds+=",/orcd/data/ki/002/core/bcc/IGB_Resources/genomes:/genomes"
 
 export APPTAINER_BIND="$binds"
 
@@ -53,9 +53,13 @@ cat 1>&2 <<END
 
    From local host run:
     
-    t
+    ssh -t -L PORT:localhost:SOCKET kerberosID@orcd-login004.mit.edu ssh -t node -L SOCKET:localhost:SOCKET
   
-2. log in to RStudio Server using the following credentials:
+2. Once connected, open your web browser and go to:
+
+      http://localhost:PORT
+
+3. log in to RStudio Server using the following credentials:
 
    user: ${APPTAINERENV_USER}
    password: ${APPTAINERENV_PASSWORD}
@@ -68,7 +72,7 @@ When done using RStudio Server, terminate the job by:
       scancel -f ${SLURM_JOB_ID}
 END
 
-apptainer exec --cleanenv -H $PWD:/home/rstudio docker://yannvrb56/r441seurat5signacazimuth /usr/lib/rstudio-server/bin/rserver \
+apptainer exec --cleanenv -H $PWD:/home/rstudio docker://bumproo/bulk_r451:v1 /usr/lib/rstudio-server/bin/rserver \
             --server-user ${USER} --www-port ${PORT} \
             --auth-none=0 \
             --auth-pam-helper-path=pam-helper \

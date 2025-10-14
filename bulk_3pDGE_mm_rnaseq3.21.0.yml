@@ -1,0 +1,22 @@
+launch:
+  - name: 'test_3PDGE'
+    workspace: 'Koch_Institute_Bioinformatics/bioinformatics_core'
+    pipeline: 'rnaseq-3.21.0'
+    params:
+      input: "$INPUT"
+      custom_config_base: false
+      fasta: "$FASTA"
+      gtf: "$GTF"
+      star_index: "$STAR_INDEX"
+      salmon_index: "$SALMON_INDEX"
+      rsem_index: "$RSEM_INDEX"
+      with_umi: true
+      skip_umi_extract: true
+      umitools_umi_separator: ":"
+      extra_star_align_args: "--alignIntronMax 1000000 --alignIntronMin 20 --alignMatesGapMax 1000000 --alignSJoverhangMin 8 --outFilterMismatchNmax 999 --outFilterMultimapNmax 20 --outFilterType BySJout --outFilterMismatchNoverLmax 0.1 --clip3pAdapterSeq AAAAAAAA"
+      multiqc_title: "$MULTIQC_TITLE"
+      aligner: "star_salmon"
+      save_align_intermeds: true
+      pseudo_aligner: "salmon"
+      skip_stringtie: true
+      outdir: "$OUTDIR"
