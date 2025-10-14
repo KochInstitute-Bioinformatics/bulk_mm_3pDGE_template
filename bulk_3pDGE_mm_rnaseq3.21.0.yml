@@ -1,5 +1,5 @@
 launch:
-  - name: 'test_3PDGE'
+  - name: 'mm_3PDGE'
     workspace: 'Koch_Institute_Bioinformatics/bioinformatics_core'
     pipeline: 'rnaseq-3.21.0'
     params:
