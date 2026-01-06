@@ -1,6 +1,6 @@
 launch:
   - name: 'mm_3PDGE'
-    workspace: 'Koch_Institute_Bioinformatics/bioinformatics_core'
+    workspace: 'Koch_Institute_Bioinformatics/dsmi_core'
     pipeline: 'rnaseq-3.21.0'
     params:
       input: "$INPUT"
@@ -19,4 +19,5 @@ launch:
       save_align_intermeds: true
       pseudo_aligner: "salmon"
       skip_stringtie: true
+
       outdir: "$OUTDIR"
